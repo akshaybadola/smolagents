@@ -14,6 +14,7 @@
 # WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
 # See the License for the specific language governing permissions and
 # limitations under the License.
+import importlib
 import base64
 import json
 import pickle
@@ -23,9 +24,12 @@ from io import BytesIO
 from pathlib import Path
 from textwrap import dedent
 from typing import Any
+import logging
 
 import PIL.Image
 import requests
+from PIL import Image
+from websocket import create_connection
 
 from .local_python_executor import PythonExecutor
 from .monitoring import LogLevel
@@ -35,17 +39,26 @@ from .utils import AgentError
 
 try:
     from dotenv import load_dotenv
-
     load_dotenv()
 except ModuleNotFoundError:
     pass
 
+try:
+    import podman
+except ModuleNotFoundError:
+    print("podman not found. Will try to run without podman")
+
+try:
+    import docker
+except ModuleNotFoundError:
+    print("docker not found. Will try to run without docker")
+
 
 class RemotePythonExecutor(PythonExecutor):
-    def __init__(self, additional_imports: list[str], logger):
+    def __init__(self, additional_imports: list[str], logger: logging.Logger):
         self.additional_imports = additional_imports
         self.logger = logger
-        self.logger.log("Initializing executor, hold on...")
+        self.logger.info("Initializing executor, hold on...")
         self.final_answer_pattern = re.compile(r"^final_answer\((.*)\)$", re.M)
         self.installed_packages = []
 
@@ -53,20 +66,19 @@ class RemotePythonExecutor(PythonExecutor):
         raise NotImplementedError
 
     def send_tools(self, tools: dict[str, Tool]):
-        # Install tool packages
-        packages_to_install = {
-            pkg
-            for tool in tools.values()
-            for pkg in tool.to_dict()["requirements"]
-            if pkg not in self.installed_packages + ["smolagents"]
-        }
-        if packages_to_install:
-            self.installed_packages += self.install_packages(list(packages_to_install))
-        # Get tool definitions
-        code = get_tools_definition_code(tools)
-        if code:
-            execution = self.run_code_raise_errors(code)
-            self.logger.log(execution[1])
+        tool_definition_code = get_tools_definition_code(tools)
+
+        packages_to_install = set()
+        for tool in tools.values():
+            for package in tool.to_dict()["requirements"]:
+                if package not in self.installed_packages:
+                    packages_to_install.add(package)
+                    self.installed_packages.append(package)
+
+        execution = self.run_code_raise_errors(
+            f"!pip install {' '.join(packages_to_install)}\n" + tool_definition_code
+        )
+        self.logger.debug(execution[1])
 
     def send_variables(self, variables: dict):
         """
@@ -89,7 +101,7 @@ locals().update(vars_dict)
     def install_packages(self, additional_imports: list[str]):
         if additional_imports:
             _, execution_logs = self.run_code_raise_errors(f"!pip install {' '.join(additional_imports)}")
-            self.logger.log(execution_logs)
+            self.logger.debug(execution_logs)
         return additional_imports
 
 
@@ -113,7 +125,7 @@ class E2BExecutor(RemotePythonExecutor):
             )
         self.sandbox = Sandbox(**kwargs)
         self.installed_packages = self.install_packages(additional_imports)
-        self.logger.log("E2B is running", level=LogLevel.INFO)
+        self.logger.log(msg="E2B is running", level=LogLevel.INFO)
 
     def run_code_raise_errors(self, code: str, return_final_answer: bool = False) -> tuple[Any, str]:
         execution = self.sandbox.run_code(
@@ -157,19 +169,20 @@ class E2BExecutor(RemotePythonExecutor):
             return None, execution_logs
 
 
-class DockerExecutor(RemotePythonExecutor):
+class ContainerExecutor(RemotePythonExecutor):
     """
-    Executes Python code using Jupyter Kernel Gateway in a Docker container.
+    Executes Python code using Jupyter Kernel Gateway in a :code:`Podman` container.
     """
 
     def __init__(
         self,
+        module_name: str,
+        image_name: str,
         additional_imports: list[str],
         logger,
-        host: str = "127.0.0.1",
-        port: int = 8888,
-        image_name: str = "jupyter-kernel",
-        build_new_image: bool = True,
+        host: str,
+        port: int,
+        build_new_image: bool = False,
         container_run_kwargs: dict[str, Any] | None = None,
     ):
         """
@@ -186,77 +199,105 @@ class DockerExecutor(RemotePythonExecutor):
         """
         super().__init__(additional_imports, logger)
         try:
-            import docker
-            from websocket import create_connection
+            self.module = importlib.import_module(module_name)
         except ModuleNotFoundError:
             raise ModuleNotFoundError(
-                "Please install 'docker' extra to use DockerExecutor: `pip install 'smolagents[docker]'`"
+                f"Please install '{module_name}' extra to use the Container module"
             )
         self.host = host
         self.port = port
         self.image_name = image_name
+        self.build_new_image = build_new_image
+        self.container_run_kwargs = container_run_kwargs
 
         # Initialize Docker
         try:
-            self.client = docker.from_env()
-        except docker.errors.DockerException as e:
-            raise RuntimeError("Could not connect to Docker daemon: make sure Docker is running.") from e
+            self.client = self.module.from_env()
+        except Exception as e:
+            raise RuntimeError("Could not connect to Container daemon: make sure Contanier is running.") from e
+        self.container = None
+        self._init_container()
 
-        # Build and start container
+    @property
+    def container_running_p(self):
+        return self.container is not None and self.container.status == "running"  # type: ignore
+
+    @property
+    def image_exists_p(self):
+        images = self.client.images.list()
+        return any(any(self.image_name in t for t in  x.tags) for x in images)
+
+    def _kill_existing_containers(self):
+        containers = self.client.containers.list()
+        for c in containers:
+            if any(self.image_name in t for t in c.image.tags):
+                c.stop()
+
+    def _init_container(self):
+        self._kill_existing_containers()
         try:
-            # Check if image exists, unless forced to rebuild
-            if not build_new_image:
-                try:
-                    self.client.images.get(self.image_name)
-                    self.logger.log(f"Using existing Docker image: {self.image_name}", level=LogLevel.INFO)
-                except docker.errors.ImageNotFound:
-                    self.logger.log(f"Image {self.image_name} not found, building...", level=LogLevel.INFO)
-                    build_new_image = True
+            if self.image_exists_p:
+                self.logger.log(msg=f"Using existing Docker image: {self.image_name}", level=LogLevel.INFO)
+        except Exception as e:
+            self.logger.log(msg=f"Image {self.image_name} not found, building... Error: {e}", level=LogLevel.INFO)
+            self.build_new_image = True
+        if self.build_new_image:
+            self._create_image()
+        if not self.container_running_p:
+            self._start_container()
 
-            if build_new_image:
-                self.logger.log(f"Building Docker image {self.image_name}...", level=LogLevel.INFO)
-                dockerfile_path = Path(__file__).parent / "Dockerfile"
-                if not dockerfile_path.exists():
-                    with open(dockerfile_path, "w") as f:
-                        f.write(
-                            dedent(
-                                """\
-                                FROM python:3.12-slim
+    def _create_image(self):
+        try:
+            self.logger.log(msg=f"Building Docker image {self.image_name}...", level=LogLevel.INFO)
+            dockerfile_path = Path(__file__).parent / "Dockerfile"
+            if not dockerfile_path.exists():
+                with open(dockerfile_path, "w") as f:
+                    f.write(
+                        dedent(
+                            """\
+                            FROM python:3.12-slim
 
-                                RUN pip install jupyter_kernel_gateway jupyter_client
+                            RUN pip install jupyter_kernel_gateway jupyter_client
 
-                                EXPOSE 8888
-                                CMD ["jupyter", "kernelgateway", "--KernelGatewayApp.ip='0.0.0.0'", "--KernelGatewayApp.port=8888", "--KernelGatewayApp.allow_origin='*'"]
-                                """
-                            )
+                            EXPOSE 8888
+                            CMD ["jupyter", "kernelgateway", "--KernelGatewayApp.ip='0.0.0.0'", "--KernelGatewayApp.port=8888", "--KernelGatewayApp.allow_origin='*'"]
+                            """
                         )
-                _, build_logs = self.client.images.build(
-                    path=str(dockerfile_path.parent), dockerfile=str(dockerfile_path), tag=self.image_name
-                )
-                self.logger.log(build_logs, level=LogLevel.DEBUG)
+                    )
+            _, build_logs = self.client.images.build(
+                path=str(dockerfile_path.parent), dockerfile=str(dockerfile_path), tag=self.image_name
+            )
+            self.logger.log(build_logs, level=LogLevel.DEBUG)
+        except Exception as e:
+            self.cleanup()
+            raise RuntimeError(f"Failed to initialize Jupyter kernel: {e}") from e
 
-            self.logger.log(f"Starting container on {host}:{port}...", level=LogLevel.INFO)
+    def _start_container(self):
+        try:
+            self.logger.log(msg=f"Starting container on {self.host}:{self.port}...", level=LogLevel.INFO)
             # Create base container parameters
             container_kwargs = {}
-            if container_run_kwargs:
-                container_kwargs.update(container_run_kwargs)
+            if self.container_run_kwargs:
+                container_kwargs.update(self.container_run_kwargs)
 
             # Ensure required port mapping and background running
             if not isinstance(container_kwargs.get("ports"), dict):
                 container_kwargs["ports"] = {}
-            container_kwargs["ports"]["8888/tcp"] = (host, port)
+            container_kwargs["ports"]["8888/tcp"] = (self.host, self.port)
             container_kwargs["detach"] = True
 
             self.container = self.client.containers.run(self.image_name, **container_kwargs)
 
             retries = 0
-            while self.container.status != "running" and retries < 5:
-                self.logger.log(f"Container status: {self.container.status}, waiting...", level=LogLevel.INFO)
-                time.sleep(1)
-                self.container.reload()
+            while True:
+                self.logger.log(msg=f"Container status: {self.container.status}, waiting...", level=LogLevel.INFO)
+                time.sleep(2)
                 retries += 1
+                if self.container.status == "running" or retries > 5:  # type: ignore
+                    break
+                self.container.reload()  # type: ignore
 
-            self.base_url = f"http://{host}:{port}"
+            self.base_url = f"http://{self.host}:{self.port}"
 
             # Create new kernel via HTTP
             r = requests.post(f"{self.base_url}/api/kernels")
@@ -274,24 +315,19 @@ class DockerExecutor(RemotePythonExecutor):
                 raise RuntimeError(f"Failed to create kernel: Status {r.status_code}\nResponse: {r.text}") from None
 
             self.kernel_id = r.json()["id"]
-
-            ws_url = f"ws://{host}:{port}/api/kernels/{self.kernel_id}/channels"
-            self.ws = create_connection(ws_url)
-
-            self.installed_packages = self.install_packages(additional_imports)
-            self.logger.log(
-                f"Container {self.container.short_id} is running with kernel {self.kernel_id}", level=LogLevel.INFO
-            )
-
+            self.ws_url = f"ws://{self.host}:{self.port}/api/kernels/{self.kernel_id}/channels"
         except Exception as e:
             self.cleanup()
             raise RuntimeError(f"Failed to initialize Jupyter kernel: {e}") from e
 
-    def run_code_raise_errors(self, code_action: str, return_final_answer: bool = False) -> tuple[Any, str]:
+    def run_code_raise_errors(self, code_action: str,
+                              return_final_answer: bool = False) -> tuple[Any, str]:
         """
         Execute code and return result based on whether it's a final answer.
         """
-        try:
+        if self.container is None:
+            raise RuntimeError("Container is not initialized")
+        try:  # type: ignore
             if return_final_answer:
                 match = self.final_answer_pattern.search(code_action)
                 if match:
@@ -370,6 +406,7 @@ class DockerExecutor(RemotePythonExecutor):
             },
         }
 
+        self.ws = create_connection(self.ws_url)
         self.ws.send(json.dumps(execute_request))
         return msg_id
 
@@ -377,16 +414,50 @@ class DockerExecutor(RemotePythonExecutor):
         """Clean up resources."""
         try:
             if hasattr(self, "container"):
-                self.logger.log(f"Stopping and removing container {self.container.short_id}...", level=LogLevel.INFO)
-                self.container.stop()
-                self.container.remove()
-                self.logger.log("Container cleanup completed", level=LogLevel.INFO)
+                self.logger.log(msg=f"Stopping and removing container {self.container.short_id}...", level=LogLevel.INFO)
+                if self.container is not None:
+                    self.container.stop()
+                self.logger.log(msg="Container cleanup completed", level=LogLevel.INFO)
         except Exception as e:
             self.logger.log_error(f"Error during cleanup: {e}")
+
+    def remove_container(self):
+        if self.container is not None:
+            self.container.remove()
 
     def delete(self):
         """Ensure cleanup on deletion."""
         self.cleanup()
 
 
-__all__ = ["E2BExecutor", "DockerExecutor"]
+class PodmanExecutor(ContainerExecutor):
+    """
+    Executes Python code using Jupyter Kernel Gateway in a :code:`Podman` container.
+    """
+
+    def __init__(
+        self,
+        additional_imports: list[str],
+        logger,
+        host: str = "127.0.0.1",
+        port: int = 8888,
+    ):
+        super().__init__("podman", "jupyter", additional_imports, logger, host, port)
+
+
+class DockerExecutor(ContainerExecutor):
+    """
+    Executes Python code using Jupyter Kernel Gateway in a :code:`Podman` container.
+    """
+
+    def __init__(
+        self,
+        additional_imports: list[str],
+        logger,
+        host: str = "127.0.0.1",
+        port: int = 8888,
+    ):
+        super().__init__("docker", "jupyter", additional_imports, logger, host, port)
+
+
+__all__ = ["E2BExecutor", "DockerExecutor", "PodmanExecutor"]

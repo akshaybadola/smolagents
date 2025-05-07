@@ -63,7 +63,7 @@ from .monitoring import (
     LogLevel,
     Monitor,
 )
-from .remote_executors import DockerExecutor, E2BExecutor
+from .remote_executors import DockerExecutor, E2BExecutor, PodmanExecutor
 from .tools import Tool
 from .utils import (
     AgentError,
@@ -1269,11 +1269,13 @@ class CodeAgent(MultiStepAgent):
 
     def create_python_executor(self) -> PythonExecutor:
         match self.executor_type:
-            case "e2b" | "docker":
+            case "e2b" | "docker" | "podman":
                 if self.managed_agents:
                     raise Exception("Managed agents are not yet supported with remote code execution.")
                 if self.executor_type == "e2b":
                     return E2BExecutor(self.additional_authorized_imports, self.logger, **self.executor_kwargs)
+                elif self.executor_type == "podman":
+                    return PodmanExecutor(self.additional_authorized_imports, self.logger, **self.executor_kwargs)
                 else:
                     return DockerExecutor(self.additional_authorized_imports, self.logger, **self.executor_kwargs)
             case "local":

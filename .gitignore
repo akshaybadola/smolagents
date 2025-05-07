@@ -3,6 +3,10 @@ logs
 tmp
 wandb
 
+# Backup files
+*~
+*.orig
+
 # Data
 data
 outputs

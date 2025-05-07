@@ -30,9 +30,10 @@ import PIL.Image
 import requests
 from PIL import Image
 from websocket import create_connection
+from common_pyutil.functional import lens
 
 from .local_python_executor import PythonExecutor
-from .monitoring import LogLevel
+from .monitoring import LogLevel, AgentLogger
 from .tools import Tool, get_tools_definition_code
 from .utils import AgentError
 
@@ -55,10 +56,10 @@ except ModuleNotFoundError:
 
 
 class RemotePythonExecutor(PythonExecutor):
-    def __init__(self, additional_imports: list[str], logger: logging.Logger):
+    def __init__(self, additional_imports: list[str], logger: AgentLogger):
         self.additional_imports = additional_imports
         self.logger = logger
-        self.logger.info("Initializing executor, hold on...")
+        self.logger.log("Initializing executor, hold on...")
         self.final_answer_pattern = re.compile(r"^final_answer\((.*)\)$", re.M)
         self.installed_packages = []
 
@@ -78,7 +79,7 @@ class RemotePythonExecutor(PythonExecutor):
         execution = self.run_code_raise_errors(
             f"!pip install {' '.join(packages_to_install)}\n" + tool_definition_code
         )
-        self.logger.debug(execution[1])
+        self.logger.log(execution[1])
 
     def send_variables(self, variables: dict):
         """
@@ -101,7 +102,7 @@ locals().update(vars_dict)
     def install_packages(self, additional_imports: list[str]):
         if additional_imports:
             _, execution_logs = self.run_code_raise_errors(f"!pip install {' '.join(additional_imports)}")
-            self.logger.debug(execution_logs)
+            self.logger.log(execution_logs)
         return additional_imports
 
 
@@ -125,7 +126,7 @@ class E2BExecutor(RemotePythonExecutor):
             )
         self.sandbox = Sandbox(**kwargs)
         self.installed_packages = self.install_packages(additional_imports)
-        self.logger.log(msg="E2B is running", level=LogLevel.INFO)
+        self.logger.log("E2B is running", level=LogLevel.INFO)
 
     def run_code_raise_errors(self, code: str, return_final_answer: bool = False) -> tuple[Any, str]:
         execution = self.sandbox.run_code(
@@ -216,6 +217,7 @@ class ContainerExecutor(RemotePythonExecutor):
         except Exception as e:
             raise RuntimeError("Could not connect to Container daemon: make sure Contanier is running.") from e
         self.container = None
+        self.ws = None
         self._init_container()
 
     @property
@@ -237,9 +239,9 @@ class ContainerExecutor(RemotePythonExecutor):
         self._kill_existing_containers()
         try:
             if self.image_exists_p:
-                self.logger.log(msg=f"Using existing Docker image: {self.image_name}", level=LogLevel.INFO)
+                self.logger.log(f"Using existing Docker image: {self.image_name}", level=LogLevel.INFO)
         except Exception as e:
-            self.logger.log(msg=f"Image {self.image_name} not found, building... Error: {e}", level=LogLevel.INFO)
+            self.logger.log(f"Image {self.image_name} not found, building... Error: {e}", level=LogLevel.INFO)
             self.build_new_image = True
         if self.build_new_image:
             self._create_image()
@@ -248,7 +250,7 @@ class ContainerExecutor(RemotePythonExecutor):
 
     def _create_image(self):
         try:
-            self.logger.log(msg=f"Building Docker image {self.image_name}...", level=LogLevel.INFO)
+            self.logger.log(f"Building Docker image {self.image_name}...", level=LogLevel.INFO)
             dockerfile_path = Path(__file__).parent / "Dockerfile"
             if not dockerfile_path.exists():
                 with open(dockerfile_path, "w") as f:
@@ -274,7 +276,7 @@ class ContainerExecutor(RemotePythonExecutor):
 
     def _start_container(self):
         try:
-            self.logger.log(msg=f"Starting container on {self.host}:{self.port}...", level=LogLevel.INFO)
+            self.logger.log(f"Starting container on {self.host}:{self.port}...", level=LogLevel.INFO)
             # Create base container parameters
             container_kwargs = {}
             if self.container_run_kwargs:
@@ -290,8 +292,9 @@ class ContainerExecutor(RemotePythonExecutor):
 
             retries = 0
             while True:
-                self.logger.log(msg=f"Container status: {self.container.status}, waiting...", level=LogLevel.INFO)
-                time.sleep(2)
+                self.logger.log(f"Container status: {self.container.status}, waiting...",
+                                level=LogLevel.INFO)
+                time.sleep(1)
                 retries += 1
                 if self.container.status == "running" or retries > 5:  # type: ignore
                     break
@@ -351,6 +354,7 @@ class ContainerExecutor(RemotePythonExecutor):
 
             while True:
                 msg = json.loads(self.ws.recv())
+                print(msg)
                 msg_type = msg.get("msg_type", "")
                 parent_msg_id = msg.get("parent_header", {}).get("msg_id")
 
@@ -366,13 +370,23 @@ class ContainerExecutor(RemotePythonExecutor):
                         waiting_for_idle = True
                     else:
                         outputs.append(text)
+                elif msg_type == "execute_result":
+                    text = lens(msg, "content", "data", "text/plain")
+                    if text:
+                        if return_final_answer and text.startswith("RESULT_PICKLE:"):
+                            pickle_data = text[len("RESULT_PICKLE:") :].strip()
+                            result = pickle.loads(base64.b64decode(pickle_data))
+                            waiting_for_idle = True
+                        else:
+                            outputs.append(text)
                 elif msg_type == "error":
                     traceback = msg["content"].get("traceback", [])
                     raise AgentError("\n".join(traceback), self.logger)
                 elif msg_type == "status" and msg["content"]["execution_state"] == "idle":
                     if not return_final_answer or waiting_for_idle:
                         break
-
+            # if self.ws is not None:
+            #     self.ws.close()
             return result, "".join(outputs)
 
         except Exception as e:
@@ -414,10 +428,10 @@ class ContainerExecutor(RemotePythonExecutor):
         """Clean up resources."""
         try:
             if hasattr(self, "container"):
-                self.logger.log(msg=f"Stopping and removing container {self.container.short_id}...", level=LogLevel.INFO)
+                self.logger.log(f"Stopping and removing container {self.container.short_id}...", level=LogLevel.INFO)
                 if self.container is not None:
                     self.container.stop()
-                self.logger.log(msg="Container cleanup completed", level=LogLevel.INFO)
+                self.logger.log("Container cleanup completed", level=LogLevel.INFO)
         except Exception as e:
             self.logger.log_error(f"Error during cleanup: {e}")
 

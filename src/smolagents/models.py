@@ -11,6 +11,7 @@
 # WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
 # See the License for the specific language governing permissions and
 # limitations under the License.
+import asyncio
 import json
 import logging
 import os
@@ -26,6 +27,7 @@ from typing import TYPE_CHECKING, Any
 
 from .tools import Tool
 from .utils import _is_package_available, encode_image_base64, make_image_url, parse_json_blob
+from .llama_client import Client
 
 
 if TYPE_CHECKING:
@@ -946,6 +948,100 @@ class ApiModel(Model):
         raise NotImplementedError("Subclasses must implement this method to create a client")
 
 
+class LlamaOAICompatModel(Model):
+    """
+    Model for using [llama.cpp](https://github.com/ggml-org/llama.cpp)
+    with an OpenAI compatible endpoint.
+
+    Parameters:
+        host (`str`):
+            Host on which it is serving
+        port (`int`):
+            Port on the host
+        custom_role_conversions (`dict[str, str`], **optional**):
+            Mapping to convert  between internal role names and API-specific role names. Defaults to None.
+        **kwargs: Additional keyword arguments to pass to the parent class.
+    """
+
+    def __init__(
+            self, host: str, port: int,
+            custom_role_conversions: dict[str, str] | None = None,
+            client: Any | None = None,
+            **kwargs
+    ):
+        super().__init__(**kwargs)
+        self.host = host
+        self.port = port
+        self.root_url = f"http://{host}:{port}"
+        self.custom_role_conversions = custom_role_conversions or {}
+        self.client = Client(self.root_url)
+        try:
+            self.client.check_health()
+        except Exception as e:
+            raise RuntimeError(f"Could not create client {e}")
+
+    def generate(
+        self,
+        messages: list[dict[str, str | list[dict]]],
+        stop_sequences: list[str] | None = None,
+        grammar: str | None = None,
+        tools_to_call_from: list[Tool] | None = None,
+        **kwargs,
+    ) -> ChatMessage:
+        completion_kwargs = self._prepare_completion_kwargs(
+            messages=messages,
+            stop_sequences=stop_sequences,
+            grammar=grammar,
+            tools_to_call_from=tools_to_call_from,
+            model=self.model_id,
+            convert_images_to_image_urls=True,
+            custom_role_conversions=self.custom_role_conversions,
+            **kwargs,
+        )
+
+        import ipdb; ipdb.set_trace()
+        response = asyncio.run(self.client.post(**completion_kwargs))
+        self.last_input_token_count = response.usage.prompt_tokens
+        self.last_output_token_count = response.usage.completion_tokens
+        return ChatMessage.from_dict(
+            response.choices[0].message.model_dump(include={"role", "content", "tool_calls"}),
+            raw=response,
+        )
+
+    # def generate_stream(
+    #     self,
+    #     messages: list[dict[str, str | list[dict]]],
+    #     stop_sequences: list[str] | None = None,
+    #     grammar: str | None = None,
+    #     tools_to_call_from: list[Tool] | None = None,
+    #     **kwargs,
+    # ) -> Generator[ChatMessageStreamDelta]:
+    #     if tools_to_call_from:
+    #         raise NotImplementedError("Streaming is not yet supported for tool calling")
+    #     completion_kwargs = self._prepare_completion_kwargs(
+    #         messages=messages,
+    #         stop_sequences=stop_sequences,
+    #         grammar=grammar,
+    #         tools_to_call_from=tools_to_call_from,
+    #         model=self.model_id,
+    #         custom_role_conversions=self.custom_role_conversions,
+    #         convert_images_to_image_urls=True,
+    #         **kwargs,
+    #     )
+    #     for event in self.client.completion(**completion_kwargs, stream=True, stream_options={"include_usage": True}):
+    #         if event.choices:
+    #             if event.choices[0].delta is None:
+    #                 if not getattr(event.choices[0], "finish_reason", None):
+    #                     raise ValueError(f"No content or tool calls in event: {event}")
+    #             else:
+    #                 yield ChatMessageStreamDelta(
+    #                     content=event.choices[0].delta.content,
+    #                 )
+    #         if getattr(event, "usage", None):
+    #             self.last_input_token_count = event.usage.prompt_tokens
+    #             self.last_output_token_count = event.usage.completion_tokens
+
+
 class LiteLLMModel(ApiModel):
     """Model to use [LiteLLM Python SDK](https://docs.litellm.ai/docs/#litellm-python-sdk) to access hundreds of LLMs.
 
@@ -1691,4 +1787,5 @@ __all__ = [
     "AzureOpenAIServerModel",
     "AmazonBedrockServerModel",
     "ChatMessage",
+    "LlamaOAICompatModel",
 ]

@@ -63,12 +63,12 @@ class RemotePythonExecutor(PythonExecutor):
         self.final_answer_pattern = re.compile(r"^final_answer\((.*)\)$", re.M)
         self.installed_packages = []
 
-    def run_code_raise_errors(self, code: str, return_final_answer: bool = False) -> tuple[Any, str]:
+    def run_code_raise_errors(self, code: str,
+                              return_final_answer: bool = False) -> tuple[Any, str]:
         raise NotImplementedError
 
     def send_tools(self, tools: dict[str, Tool]):
         tool_definition_code = get_tools_definition_code(tools)
-
         packages_to_install = set()
         for tool in tools.values():
             for package in tool.to_dict()["requirements"]:
@@ -184,6 +184,7 @@ class ContainerExecutor(RemotePythonExecutor):
         host: str,
         port: int,
         build_new_image: bool = False,
+        stop_existing: bool = True,
         container_run_kwargs: dict[str, Any] | None = None,
     ):
         """
@@ -229,14 +230,14 @@ class ContainerExecutor(RemotePythonExecutor):
         images = self.client.images.list()
         return any(any(self.image_name in t for t in  x.tags) for x in images)
 
-    def _kill_existing_containers(self):
+    def _stop_existing_containers(self):
         containers = self.client.containers.list()
         for c in containers:
             if any(self.image_name in t for t in c.image.tags):
                 c.stop()
 
     def _init_container(self):
-        self._kill_existing_containers()
+        self._stop_existing_containers()
         try:
             if self.image_exists_p:
                 self.logger.log(f"Using existing Docker image: {self.image_name}", level=LogLevel.INFO)
@@ -455,8 +456,9 @@ class PodmanExecutor(ContainerExecutor):
         logger,
         host: str = "127.0.0.1",
         port: int = 8888,
+        **kwargs
     ):
-        super().__init__("podman", "jupyter", additional_imports, logger, host, port)
+        super().__init__("podman", "jupyter", additional_imports, logger, host, port, **kwargs)
 
 
 class DockerExecutor(ContainerExecutor):
@@ -470,8 +472,9 @@ class DockerExecutor(ContainerExecutor):
         logger,
         host: str = "127.0.0.1",
         port: int = 8888,
+        **kwargs
     ):
-        super().__init__("docker", "jupyter", additional_imports, logger, host, port)
+        super().__init__("docker", "jupyter", additional_imports, logger, host, port, **kwargs)
 
 
 __all__ = ["E2BExecutor", "DockerExecutor", "PodmanExecutor"]

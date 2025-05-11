@@ -960,6 +960,8 @@ class LlamaOAICompatModel(Model):
             Port on the host
         custom_role_conversions (`dict[str, str`], **optional**):
             Mapping to convert  between internal role names and API-specific role names. Defaults to None.
+        flatten_messages_as_text (`bool`, default `False`):
+            Whether to flatten messages as text.
         **kwargs: Additional keyword arguments to pass to the parent class.
     """
 
@@ -967,6 +969,9 @@ class LlamaOAICompatModel(Model):
             self, host: str, port: int,
             custom_role_conversions: dict[str, str] | None = None,
             client: Any | None = None,
+            flatten_messages_as_text: bool = False,
+            no_system_role: bool = False,
+            only_last_message: bool = False,
             **kwargs
     ):
         super().__init__(**kwargs)
@@ -975,6 +980,8 @@ class LlamaOAICompatModel(Model):
         self.root_url = f"http://{host}:{port}"
         self.custom_role_conversions = custom_role_conversions or {}
         self.client = Client(self.root_url)
+        self.no_system_role = no_system_role
+        self.only_last_message = only_last_message
         try:
             self.client.check_health()
         except Exception as e:
@@ -998,15 +1005,23 @@ class LlamaOAICompatModel(Model):
             custom_role_conversions=self.custom_role_conversions,
             **kwargs,
         )
-
-        import ipdb; ipdb.set_trace()
-        response = asyncio.run(self.client.post(**completion_kwargs))
-        self.last_input_token_count = response.usage.prompt_tokens
-        self.last_output_token_count = response.usage.completion_tokens
-        return ChatMessage.from_dict(
-            response.choices[0].message.model_dump(include={"role", "content", "tool_calls"}),
+        if self.no_system_role:
+            if completion_kwargs["messages"][0]["role"] == MessageRole.SYSTEM:
+                txt = completion_kwargs["messages"][0]["content"][0]["text"]
+                completion_kwargs["messages"][1]["content"].insert(0, {"type": "text", "text": txt})
+                completion_kwargs["messages"] = completion_kwargs["messages"][1:]
+        if self.only_last_message:
+            completion_kwargs["messages"] = [completion_kwargs["messages"][-1]]
+        response = asyncio.run(self.client.post(completion_kwargs))
+        self.last_input_token_count = response["usage"]["prompt_tokens"]
+        self.last_output_token_count = response["usage"]["completion_tokens"]
+        chatmsg = ChatMessage.from_dict(
+            {"role": "assistant",
+             "tool_calls": response["choices"][0]["tool_calls"],
+             "content": response["choices"][0]["message"]["content"]},
             raw=response,
         )
+        return chatmsg
 
     # def generate_stream(
     #     self,
@@ -1454,6 +1469,7 @@ class OpenAIServerModel(ApiModel):
         client_kwargs: dict[str, Any] | None = None,
         custom_role_conversions: dict[str, str] | None = None,
         flatten_messages_as_text: bool = False,
+        no_system_role: bool = False,
         **kwargs,
     ):
         self.client_kwargs = {
@@ -1469,6 +1485,7 @@ class OpenAIServerModel(ApiModel):
             flatten_messages_as_text=flatten_messages_as_text,
             **kwargs,
         )
+        self.no_system_role = no_system_role
 
     def create_client(self):
         try:
@@ -1533,14 +1550,19 @@ class OpenAIServerModel(ApiModel):
             convert_images_to_image_urls=True,
             **kwargs,
         )
+        if self.no_system_role:
+            if completion_kwargs["messages"][0]["role"] == MessageRole.SYSTEM:
+                txt = completion_kwargs["messages"][0]["content"][0]["text"]
+                completion_kwargs["messages"][1]["content"].insert(0, {"type": "text", "text": txt})
+                completion_kwargs["messages"] = completion_kwargs["messages"][1:]
         response = self.client.chat.completions.create(**completion_kwargs)
         self.last_input_token_count = response.usage.prompt_tokens
         self.last_output_token_count = response.usage.completion_tokens
-
-        return ChatMessage.from_dict(
+        chatmsg = ChatMessage.from_dict(
             response.choices[0].message.model_dump(include={"role", "content", "tool_calls"}),
             raw=response,
         )
+        return chatmsg
 
 
 class AzureOpenAIServerModel(OpenAIServerModel):

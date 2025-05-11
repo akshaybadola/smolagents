@@ -1,10 +1,8 @@
 import asyncio
 import httpx
-from subprocess import call
 import time
 import sys
 import json
-
 
 
 class Client:
@@ -31,7 +29,6 @@ class Client:
                             token = json.loads(temp[6:])["choices"][0]["delta"]["content"]
                         except Exception:
                             print(temp, file=sys.stderr, flush=True)
-                        # print(json.dumps({"text": token}), end="")
                         print(token, end="", flush=True)
                         count += 1
                         end_time = time.time()
@@ -45,6 +42,6 @@ class Client:
         async with httpx.AsyncClient() as client:
             response = await client.post(self.completions_url, json=messages, timeout=None)
             if response.status_code == 200:
-                return await response.json()
+                return response.json()
             else:
                 return {"error": "Could not get response"}

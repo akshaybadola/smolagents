@@ -24,9 +24,11 @@ class Client:
                     start_time = time.time()
                     count = 0
                     async for chunk in response.aiter_bytes():
-                        temp = chunk.decode().replace('\n', '', 1)
                         try:
-                            token = json.loads(temp[6:])["choices"][0]["delta"]["content"]
+                            temp = json.loads(chunk.decode().replace('\n', '', 1)[6:])
+                            token = temp["choices"][0]["delta"]["content"]
+                            if "usage" in temp:
+                                return temp["usage"]
                         except Exception:
                             print(temp, file=sys.stderr, flush=True)
                         print(token, end="", flush=True)

@@ -172,7 +172,7 @@ class E2BExecutor(RemotePythonExecutor):
 
 class ContainerExecutor(RemotePythonExecutor):
     """
-    Executes Python code using Jupyter Kernel Gateway in a :code:`Podman` container.
+    Executes Python code using Jupyter Kernel Gateway in a container.
     """
 
     def __init__(
@@ -463,7 +463,7 @@ class PodmanExecutor(ContainerExecutor):
 
 class DockerExecutor(ContainerExecutor):
     """
-    Executes Python code using Jupyter Kernel Gateway in a :code:`Podman` container.
+    Executes Python code using Jupyter Kernel Gateway in a :code:`docker` container.
     """
 
     def __init__(

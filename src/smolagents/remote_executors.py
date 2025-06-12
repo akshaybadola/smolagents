@@ -20,11 +20,12 @@ import json
 import pickle
 import re
 import time
-from io import BytesIO
+from io import BytesIO, StringIO
 from pathlib import Path
 from textwrap import dedent
 from typing import Any
 import logging
+import warnings
 
 import PIL.Image
 import requests
@@ -185,6 +186,7 @@ class ContainerExecutor(RemotePythonExecutor):
         port: int,
         build_new_image: bool = False,
         stop_existing: bool = True,
+        dockerfile_path: str = "",
         container_run_kwargs: dict[str, Any] | None = None,
     ):
         """
@@ -208,6 +210,7 @@ class ContainerExecutor(RemotePythonExecutor):
             )
         self.host = host
         self.port = port
+        self.dockerfile_path = dockerfile_path or Path(__file__).parent / "Dockerfile"
         self.image_name = image_name
         self.build_new_image = build_new_image
         self.container_run_kwargs = container_run_kwargs
@@ -240,7 +243,10 @@ class ContainerExecutor(RemotePythonExecutor):
         self._stop_existing_containers()
         try:
             if self.image_exists_p:
-                self.logger.log(f"Using existing Docker image: {self.image_name}", level=LogLevel.INFO)
+                self.logger.log(f"Using existing {self.module.__name__} image: {self.image_name}",
+                                level=LogLevel.INFO)
+            else:
+                self.build_new_image = True
         except Exception as e:
             self.logger.log(f"Image {self.image_name} not found, building... Error: {e}", level=LogLevel.INFO)
             self.build_new_image = True
@@ -252,15 +258,14 @@ class ContainerExecutor(RemotePythonExecutor):
     def _create_image(self):
         try:
             self.logger.log(f"Building Docker image {self.image_name}...", level=LogLevel.INFO)
-            dockerfile_path = Path(__file__).parent / "Dockerfile"
-            if not dockerfile_path.exists():
-                with open(dockerfile_path, "w") as f:
+            if not Path(self.dockerfile_path).exists():
+                with open(Path(self.dockerfile_path), "w") as f:
                     f.write(
                         dedent(
                             """\
                             FROM python:3.12-slim
 
-                            RUN pip install jupyter_kernel_gateway jupyter_client
+                            RUN pip install jupyter_kernel_gateway jupyter_client ipykernel
 
                             EXPOSE 8888
                             CMD ["jupyter", "kernelgateway", "--KernelGatewayApp.ip='0.0.0.0'", "--KernelGatewayApp.port=8888", "--KernelGatewayApp.allow_origin='*'"]
@@ -268,7 +273,9 @@ class ContainerExecutor(RemotePythonExecutor):
                         )
                     )
             _, build_logs = self.client.images.build(
-                path=str(dockerfile_path.parent), dockerfile=str(dockerfile_path), tag=self.image_name
+                path=str(Path(self.dockerfile_path).parent),
+                dockerfile=str(Path(self.dockerfile_path)),
+                tag=self.image_name
             )
             self.logger.log(build_logs, level=LogLevel.DEBUG)
         except Exception as e:
@@ -290,6 +297,7 @@ class ContainerExecutor(RemotePythonExecutor):
             container_kwargs["detach"] = True
 
             self.container = self.client.containers.run(self.image_name, **container_kwargs)
+            time.sleep(1)
 
             retries = 0
             while True:
@@ -456,9 +464,42 @@ class PodmanExecutor(ContainerExecutor):
         logger,
         host: str = "127.0.0.1",
         port: int = 8888,
+        user: str = "",
         **kwargs
     ):
+        self.user = user or "root"
+        if self.user == "root":
+            warnings.warn("Running as ROOT user is discouraged")
         super().__init__("podman", "jupyter", additional_imports, logger, host, port, **kwargs)
+
+    def _create_image(self):
+        if self.user != "root":
+            useradd_str = "\n".join([f"RUN useradd {self.user} -m -s /bin/bash",
+                                     f"USER {self.user}",
+                                     f"WORKDIR /home/{self.user}",
+                                     f"RUN echo 'export PATH=/home/{self.user}/.local/bin:$PATH' >> .bashrc",
+                                     f"RUN export PATH=/home/{self.user}/.local/bin:$PATH"])
+        try:
+            self.logger.log(f"Building Docker image {self.image_name}...", level=LogLevel.INFO)
+            dockerfile_str = f"""\
+FROM python:3.12-slim
+
+{useradd_str}
+
+RUN pip install {'--user' if self.user != 'root' else ''} jupyter_kernel_gateway jupyter_client ipykernel
+
+EXPOSE 8888
+CMD ["/home/{self.user}/.local/bin/jupyter", "kernelgateway", "--KernelGatewayApp.ip='0.0.0.0'", "--KernelGatewayApp.port=8888", "--KernelGatewayApp.allow_origin='*'"]"""
+            buffer = StringIO(dockerfile_str)
+            _, build_logs = self.client.images.build(
+                fileobj=buffer,
+                nocache=True,
+                tag=self.image_name
+            )
+            self.logger.log(build_logs, level=LogLevel.DEBUG)
+        except Exception as e:
+            self.cleanup()
+            raise RuntimeError(f"Failed to initialize Jupyter kernel: {e}") from e
 
 
 class DockerExecutor(ContainerExecutor):

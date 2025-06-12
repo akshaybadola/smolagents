@@ -974,6 +974,11 @@ class LlamaOAICompatModel(Model):
             Mapping to convert  between internal role names and API-specific role names. Defaults to None.
         flatten_messages_as_text (`bool`, default `False`):
             Whether to flatten messages as text.
+        no_system_role (`bool`, default `False`):
+            Do not add a system role
+        only_last_message (`bool`, default `False`):
+            Send only last message. This is only for custom Gemma model
+
         **kwargs: Additional keyword arguments to pass to the parent class.
     """
 
@@ -1025,13 +1030,16 @@ class LlamaOAICompatModel(Model):
         if self.only_last_message:
             completion_kwargs["messages"] = [completion_kwargs["messages"][-1]]
         response = asyncio.run(self.client.post(completion_kwargs))
-        self.last_input_token_count = response["usage"]["prompt_tokens"]
-        self.last_output_token_count = response["usage"]["completion_tokens"]
+        self._last_input_token_count = response["usage"]["prompt_tokens"]
+        self._last_output_token_count = response["usage"]["completion_tokens"]
+        token_usage = TokenUsage(self._last_input_token_count,
+                                 self._last_output_token_count)
         chatmsg = ChatMessage.from_dict(
             {"role": "assistant",
-             "tool_calls": response["choices"][0]["tool_calls"],
+             "tool_calls": response["choices"][0].get("tool_calls", ""),
              "content": response["choices"][0]["message"]["content"]},
             raw=response,
+            token_usage=token_usage
         )
         return chatmsg
 

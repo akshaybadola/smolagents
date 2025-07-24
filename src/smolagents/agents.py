@@ -28,7 +28,7 @@ from collections.abc import Callable, Generator
 from dataclasses import dataclass
 from logging import getLogger
 from pathlib import Path
-from typing import TYPE_CHECKING, Any, Literal, TypedDict
+from typing import TYPE_CHECKING, Any, Literal, TypedDict, Optional
 
 import jinja2
 import yaml
@@ -224,7 +224,10 @@ class MultiStepAgent(ABC):
         name (`str`, *optional*): Necessary for a managed agent only - the name by which this agent can be called.
         description (`str`, *optional*): Necessary for a managed agent only - the description of this agent.
         provide_run_summary (`bool`, *optional*): Whether to provide a run summary when called as a managed agent.
-        final_answer_checks (`list`, *optional*): List of Callables to run before returning a final answer for checking validity.
+        final_answer_checks (`list[Callable]`, *optional*): List of validation functions to run before accepting a final answer.
+            Each function should:
+            - Take the final answer and the agent's memory as arguments.
+            - Return a boolean indicating whether the final answer is valid.
     """
 
     def __init__(
@@ -1349,6 +1352,7 @@ class CodeAgent(MultiStepAgent):
         tools (`list[Tool]`): [`Tool`]s that the agent can use.
         model (`Model`): Model that will generate the agent's actions.
         prompt_templates ([`~agents.PromptTemplates`], *optional*): Prompt templates.
+        prompt_template_overrides ([`~agents.PromptTemplates`], *optional*): Specific prompt templates to override.
         additional_authorized_imports (`list[str]`, *optional*): Additional authorized imports for the agent.
         planning_interval (`int`, *optional*): Interval at which the agent will run a planning step.
         executor_type (`str`, default `"local"`): Which executor type to use between `"local"`, `"e2b"`, or `"docker"`.
@@ -1370,6 +1374,7 @@ class CodeAgent(MultiStepAgent):
         tools: list[Tool],
         model: Model,
         prompt_templates: PromptTemplates | None = None,
+        prompt_template_overrides: Optional[dict[str, str]] = None,
         additional_authorized_imports: list[str] | None = None,
         planning_interval: int | None = None,
         executor_type: str | None = "local",
@@ -1394,6 +1399,9 @@ class CodeAgent(MultiStepAgent):
             )
         if grammar and use_structured_outputs_internally:
             raise ValueError("You cannot use 'grammar' and 'use_structured_outputs_internally' at the same time.")
+        if prompt_template_overrides:
+            prompt_templates.update(prompt_template_overrides)
+
         super().__init__(
             tools=tools,
             model=model,

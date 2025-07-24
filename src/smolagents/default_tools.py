@@ -99,12 +99,28 @@ class UserInputTool(Tool):
 
 
 class DuckDuckGoSearchTool(Tool):
+    """Web search tool that performs searches using the DuckDuckGo search engine.
+
+    Args:
+        max_results (`int`, default `10`): Maximum number of search results to return.
+        rate_limit (`float`, default `1.0`): Maximum queries per second. Set to `None` to disable rate limiting.
+        **kwargs: Additional keyword arguments for the `DDGS` client.
+
+    Examples:
+        ```python
+        >>> from smolagents import DuckDuckGoSearchTool
+        >>> web_search_tool = DuckDuckGoSearchTool(max_results=5, rate_limit=2.0)
+        >>> results = web_search_tool("Hugging Face")
+        >>> print(results)
+        ```
+    """
+
     name = "web_search"
     description = """Performs a duckduckgo web search based on your query (think a Google search) then returns the top search results."""
     inputs = {"query": {"type": "string", "description": "The search query to perform."}}
     output_type = "string"
 
-    def __init__(self, max_results=10, **kwargs):
+    def __init__(self, max_results: int = 10, rate_limit: float | None = 1.0, **kwargs):
         super().__init__()
         self.max_results = max_results
         try:
@@ -208,6 +224,81 @@ class GoogleSearchTool(Tool):
                 web_snippets.append(redacted_version)
 
         return "## Search Results\n" + "\n\n".join(web_snippets)
+
+
+class ApiWebSearchTool(Tool):
+    """Web search tool that performs API-based searches.
+    By default, it uses the Brave Search API.
+
+    This tool implements a rate limiting mechanism to ensure compliance with API usage policies.
+    By default, it limits requests to 1 query per second.
+
+    Args:
+        endpoint (`str`): API endpoint URL. Defaults to Brave Search API.
+        api_key (`str`): API key for authentication.
+        api_key_name (`str`): Environment variable name containing the API key. Defaults to "BRAVE_API_KEY".
+        headers (`dict`, *optional*): Headers for API requests.
+        params (`dict`, *optional*): Parameters for API requests.
+        rate_limit (`float`, default `1.0`): Maximum queries per second. Set to `None` to disable rate limiting.
+
+    Examples:
+        ```python
+        >>> from smolagents import ApiWebSearchTool
+        >>> web_search_tool = ApiWebSearchTool(rate_limit=50.0)
+        >>> results = web_search_tool("Hugging Face")
+        >>> print(results)
+        ```
+    """
+
+    name = "web_search"
+    description = "Performs a web search for a query and returns a string of the top search results formatted as markdown with titles, URLs, and descriptions."
+    inputs = {"query": {"type": "string", "description": "The search query to perform."}}
+    output_type = "string"
+
+    def __init__(
+        self,
+        endpoint: str = "",
+        api_key: str = "",
+        api_key_name: str = "",
+        headers: dict = None,
+        params: dict = None,
+        rate_limit: float | None = 1.0,
+    ):
+        import os
+
+        super().__init__()
+        self.endpoint = endpoint or "https://api.search.brave.com/res/v1/web/search"
+        self.api_key = api_key or os.getenv(api_key_name)
+        self.headers = headers or {"X-Subscription-Token": self.api_key}
+        self.params = params or {"count": 10}
+
+    def forward(self, query: str) -> str:
+        import requests
+
+        params = {**self.params, "q": query}
+        response = requests.get(self.endpoint, headers=self.headers, params=params)
+        response.raise_for_status()
+        data = response.json()
+        results = self.extract_results(data)
+        return self.format_markdown(results)
+
+    def extract_results(self, data: dict) -> list:
+        results = []
+        for result in data.get("web", {}).get("results", []):
+            results.append(
+                {"title": result["title"], "url": result["url"], "description": result.get("description", "")}
+            )
+        return results
+
+    def format_markdown(self, results: list) -> str:
+        if not results:
+            return "No results found."
+        return "## Search Results\n\n" + "\n\n".join(
+            [
+                f"{idx}. [{result['title']}]({result['url']})\n{result['description']}"
+                for idx, result in enumerate(results, start=1)
+            ]
+        )
 
 
 class WebSearchTool(Tool):
@@ -382,7 +473,7 @@ class VisitWebpageTool(Tool):
 
 class WikipediaSearchTool(Tool):
     """
-    WikipediaSearchTool searches Wikipedia and returns a summary or full text of the given topic, along with the page URL.
+    Search Wikipedia and return the summary or full text of the requested article, along with the page URL.
 
     Attributes:
         user_agent (str): A custom user-agent string to identify the project. This is required as per Wikipedia API policies, read more here: http://github.com/martin-majlis/Wikipedia-API/blob/master/README.rst
@@ -521,6 +612,7 @@ TOOL_MAPPING = {
 }
 
 __all__ = [
+    "ApiWebSearchTool",
     "PythonInterpreterTool",
     "FinalAnswerTool",
     "UserInputTool",

@@ -23,7 +23,7 @@ import time
 from io import BytesIO, StringIO
 from pathlib import Path
 from textwrap import dedent
-from typing import Any
+from typing import Any, Optional
 import logging
 import warnings
 
@@ -57,23 +57,50 @@ except ModuleNotFoundError:
 
 
 class RemotePythonExecutor(PythonExecutor):
-    def __init__(self, additional_imports: list[str], logger: AgentLogger):
+    def __init__(self, additional_imports: list[str], logger: AgentLogger,
+                 local_packages: Optional[dict[str, str]] = None):
         self.additional_imports = additional_imports
         self.logger = logger
         self.logger.log("Initializing executor, hold on...")
         self.final_answer_pattern = re.compile(r"^final_answer\((.*)\)$", re.M)
         self.installed_packages = []
+        self.local_packages = local_packages
 
     def run_code_raise_errors(self, code: str,
                               return_final_answer: bool = False) -> tuple[Any, str]:
         raise NotImplementedError
 
+    def install_local_packages(self):
+        for pkg_name, pkg_path in self.local_packages.items():  # type: ignore
+            with open(pkg_path, "rb") as f:
+                encoded_zip = base64.b64encode(f.read()).decode('utf-8')
+            zip_name = Path(pkg_path).name
+            target_dir = pkg_name
+            execution = self.run_code_raise_errors(dedent(f"""
+            import os
+            import zipfile
+            import base64
+
+            with open("{zip_name}", "wb") as f:
+                f.write(base64.b64decode("{encoded_zip}"))
+
+            # Extract ZIP
+            with zipfile.ZipFile("{zip_name}") as zip_ref:
+                zip_ref.extractall("{target_dir}")
+
+            # Clean up ZIP file
+            os.remove("{zip_name}")
+            """))
+            self.logger.log(execution[1])
+
     def send_tools(self, tools: dict[str, Tool]):
+        self.install_local_packages()
         tool_definition_code = get_tools_definition_code(tools)
         packages_to_install = set()
         for tool in tools.values():
             for package in tool.to_dict()["requirements"]:
-                if package not in self.installed_packages:
+                if package not in self.installed_packages and\
+                   package not in self.local_packages:  # type: ignore
                     packages_to_install.add(package)
                     self.installed_packages.append(package)
 
@@ -187,21 +214,26 @@ class ContainerExecutor(RemotePythonExecutor):
         build_new_image: bool = False,
         stop_existing: bool = True,
         dockerfile_path: str = "",
+        local_packages: Optional[dict[str, str]] = None,
         container_run_kwargs: dict[str, Any] | None = None,
     ):
         """
         Initialize the Docker-based Jupyter Kernel Gateway executor.
 
         Args:
+            module_name: docker or podman
+            image_name: Name of the container image to use. If the image doesn't exist, it will be built.
             additional_imports: Additional imports to install.
             logger: Logger to use.
             host: Host to bind to.
             port: Port to bind to.
-            image_name: Name of the Docker image to use. If the image doesn't exist, it will be built.
             build_new_image: If True, the image will be rebuilt even if it already exists.
+            stop_existing: If True, then existing containers of same image are stopped else reused
+            dockerfile_path: Path to the dockerfile if build from that
+            local_packages: A :class:`dict` [package: filename] to send to container
             container_run_kwargs: Additional keyword arguments to pass to the Docker container run command.
         """
-        super().__init__(additional_imports, logger)
+        super().__init__(additional_imports, logger, local_packages)
         try:
             self.module = importlib.import_module(module_name)
         except ModuleNotFoundError:

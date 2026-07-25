@@ -58,6 +58,8 @@ class ActionStep(MemoryStep):
     model_output_message: ChatMessage | None = None
     model_output: str | None = None
     observations: str | None = None
+    observation_details: str | None = None
+    model_output_details: str | None = None
     observations_images: list["PIL.Image.Image"] | None = None
     action_output: Any = None
     token_usage: TokenUsage | None = None
@@ -193,9 +195,92 @@ class AgentMemory:
     def reset(self):
         self.steps = []
 
+    def clear_(self, attr, n: int = -1):
+        """Clear nth memory step. Defaults to last step
+
+        Args:
+            n: the index of the step to clear
+
+        """
+        try:
+            _step = self.steps[n]
+            if isinstance(_step, TaskStep):
+                return "Cannot clear Task Step"
+            elif isinstance(_step, (ActionStep, PlanningStep)):
+                if attr in {"observation", "observations"}:
+                    _step.observations = "WAS CLEARED BY YOU"  # type: ignore
+                elif attr == "all":
+                    _step.model_output = "WAS CLEARED BY YOU"  # type: ignore
+                    _step.observations = "WAS CLEARED BY YOU"               # type: ignore
+                    _step.tool_calls = [ToolCall(name='python_interpreter',  # type: ignore
+                                                 arguments="WAS CLEARED BY YOU",
+                                                 id=x.id)
+                                        for x in _step.tool_calls]  # type: ignore
+                else:
+                    return f"Bad attribute {attr}"
+                return None
+        except Exception as e:
+            return str(e)
+
+    def summarize_(self, attr, summary: str, n: int = -1):
+        """Clear nth memory step. Defaults to last step
+
+        Args:
+            n: the index of the step to clear
+
+        """
+        try:
+            _step = self.steps[n]
+            if isinstance(_step, TaskStep):
+                return "Cannot clear Task Step"
+            elif isinstance(_step, (ActionStep, PlanningStep)):
+                if attr in {"observation", "observations"}:
+                    _step.observation_details = _step.observations  # type: ignore
+                    _step.observations = f"SUMMARY: {summary}"  # type: ignore
+                elif attr == "all":
+                    _step.observation_details = _step.observations  # type: ignore
+                    _step.model_output_details = _step.model_output  # type: ignore
+                    _step.tool_calls_details = [x for x in _step.tool_calls]  # type: ignore
+                    _step.model_output = f"SUMMARY: {summary}"  # type: ignore
+                    _step.observations = f"SUMMARY: {summary}"              # type: ignore
+                    _step.tool_calls = [ToolCall(name='python_interpreter',  # type: ignore
+                                                 arguments=f"SUMMARY: {summary}",
+                                                 id=x.id)
+                                        for x in _step.tool_calls]  # type: ignore
+                else:
+                    return f"Bad attribute {attr}"
+                return None
+        except Exception as e:
+            return str(e)
+
+    def describe_(self, attr, n: int = -1):
+        """Describe summarized nth memory step. Defaults to last step
+
+        Args:
+            n: the index of the step to clear
+
+        """
+        try:
+            _step = self.steps[n]
+            if isinstance(_step, TaskStep):
+                return "Cannot describe Task Step"
+            elif isinstance(_step, (ActionStep, PlanningStep)):
+                if attr in {"observation", "observations"}:
+                    return _step.observation_details  # type: ignore
+                elif attr == "all":
+                    return {"observations": _step.observation_details,  # type: ignore
+                            "model_output": _step.model_output,         # type: ignore
+                            "tool_calls": _step.tool_calls_details}  # type: ignore
+                else:
+                    return f"Bad attribute {attr}"
+                return None
+        except Exception as e:
+            return str(e)
+
     def get_succinct_steps(self) -> list[dict]:
         return [
-            {key: value for key, value in step.dict().items() if key != "model_input_messages"} for step in self.steps
+            {key: value for key, value in step.dict().items() if key != "model_input_messages"}
+            for step in self.steps
         ]
 
     def get_full_steps(self) -> list[dict]:

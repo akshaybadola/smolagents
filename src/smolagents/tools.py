@@ -272,8 +272,6 @@ class Tool:
                     "Cannot save objects created with from_space, from_langchain or from_gradio, as this would create errors."
                 )
 
-            validate_tool_attributes(self.__class__)
-
             tool_code = "from typing import Any, Optional\n" + instance_to_source(self, base_cls=Tool)
 
         requirements = {el for el in get_imports(tool_code) if el not in sys.stdlib_module_names} | {"smolagents"}
@@ -1172,10 +1170,13 @@ class PipelineTool(Tool):
         return decoded_outputs
 
 
-def get_tools_definition_code(tools: dict[str, Tool]) -> str:
+def get_tools_definition_code(tools: dict[str, Tool], existing_imports: list[str],
+                              existing_functions: list[str]) -> str:
     tool_codes = []
     for tool in tools.values():
-        validate_tool_attributes(tool.__class__, check_imports=False)
+        validate_tool_attributes(tool.__class__, check_imports=False,
+                                 existing_imports=existing_imports,
+                                 existing_functions=existing_functions)
         tool_code = instance_to_source(tool, base_cls=Tool)
         tool_code = tool_code.replace("from smolagents.tools import Tool", "")
         tool_code += f"\n\n{tool.name} = {tool.__class__.__name__}()\n"

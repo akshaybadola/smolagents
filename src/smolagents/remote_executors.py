@@ -58,20 +58,29 @@ except ModuleNotFoundError:
 
 class RemotePythonExecutor(PythonExecutor):
     def __init__(self, additional_imports: list[str], logger: AgentLogger,
-                 local_packages: Optional[dict[str, str]] = None):
+                 local_packages: Optional[dict[str, str]],
+                 existing_imports: Optional[list[str]],
+                 existing_functions: Optional[list[str]],
+                 post_tool_install_steps: Optional[list[str]]):
         self.additional_imports = additional_imports
         self.logger = logger
         self.logger.log("Initializing executor, hold on...")
         self.final_answer_pattern = re.compile(r"^final_answer\((.*)\)$", re.M)
         self.installed_packages = []
-        self.local_packages = local_packages
+        self.local_packages = local_packages or {}
+        self.post_tool_install_steps = post_tool_install_steps
+        self.existing_imports = existing_imports
+        self.existing_functions = existing_functions
 
     def run_code_raise_errors(self, code: str,
                               return_final_answer: bool = False) -> tuple[Any, str]:
         raise NotImplementedError
 
     def install_local_packages(self):
+        if not self.local_packages:
+            return
         for pkg_name, pkg_path in self.local_packages.items():  # type: ignore
+            self.logger.log(f"Installing packages {pkg_path}")
             with open(pkg_path, "rb") as f:
                 encoded_zip = base64.b64encode(f.read()).decode('utf-8')
             zip_name = Path(pkg_path).name
@@ -95,7 +104,18 @@ class RemotePythonExecutor(PythonExecutor):
 
     def send_tools(self, tools: dict[str, Tool]):
         self.install_local_packages()
-        tool_definition_code = get_tools_definition_code(tools)
+        if self.existing_imports:
+            execution = self.run_code_raise_errors(
+                "\n".join(self.existing_imports)
+            )
+            self.logger.log("Pre install imports:\n" + execution[1])
+        if self.existing_functions:
+            execution = self.run_code_raise_errors(
+                "\n".join(self.existing_functions)
+            )
+            self.logger.log("Pre install functions:\n" + execution[1])
+        tool_definition_code = get_tools_definition_code(tools, self.existing_imports or [],
+                                                         self.existing_functions or [])
         packages_to_install = set()
         for tool in tools.values():
             for package in tool.to_dict()["requirements"]:
@@ -108,6 +128,11 @@ class RemotePythonExecutor(PythonExecutor):
             f"!pip install {' '.join(packages_to_install)}\n" + tool_definition_code
         )
         self.logger.log(execution[1])
+        if self.post_tool_install_steps:
+            execution = self.run_code_raise_errors(
+                "\n".join(self.post_tool_install_steps)
+            )
+            self.logger.log("Post install steps:\n" + execution[1])
 
     def send_variables(self, variables: dict):
         """
@@ -215,6 +240,9 @@ class ContainerExecutor(RemotePythonExecutor):
         stop_existing: bool = True,
         dockerfile_path: str = "",
         local_packages: Optional[dict[str, str]] = None,
+        existing_imports: Optional[list[str]] = None,
+        existing_functions: Optional[list[str]] = None,
+        post_tool_install_steps: Optional[list[str]] = None,
         container_run_kwargs: dict[str, Any] | None = None,
     ):
         """
@@ -233,7 +261,8 @@ class ContainerExecutor(RemotePythonExecutor):
             local_packages: A :class:`dict` [package: filename] to send to container
             container_run_kwargs: Additional keyword arguments to pass to the Docker container run command.
         """
-        super().__init__(additional_imports, logger, local_packages)
+        super().__init__(additional_imports, logger, local_packages,
+                         existing_imports, existing_functions, post_tool_install_steps)
         try:
             self.module = importlib.import_module(module_name)
         except ModuleNotFoundError:
@@ -246,6 +275,7 @@ class ContainerExecutor(RemotePythonExecutor):
         self.image_name = image_name
         self.build_new_image = build_new_image
         self.container_run_kwargs = container_run_kwargs
+        self.filter_regexp = re.compile(r'\x1b\[[0-9;]*m')
 
         # Initialize Docker
         try:
@@ -395,7 +425,6 @@ class ContainerExecutor(RemotePythonExecutor):
 
             while True:
                 msg = json.loads(self.ws.recv())
-                print(msg)
                 msg_type = msg.get("msg_type", "")
                 parent_msg_id = msg.get("parent_header", {}).get("msg_id")
 
@@ -422,13 +451,13 @@ class ContainerExecutor(RemotePythonExecutor):
                             outputs.append(text)
                 elif msg_type == "error":
                     traceback = msg["content"].get("traceback", [])
-                    raise AgentError("\n".join(traceback), self.logger)
+                    raise AgentError(self.filter_regexp.sub("", "\n".join(traceback)), self.logger)
                 elif msg_type == "status" and msg["content"]["execution_state"] == "idle":
                     if not return_final_answer or waiting_for_idle:
                         break
             # if self.ws is not None:
             #     self.ws.close()
-            return result, "".join(outputs)
+            return result, self.filter_regexp.sub("", "".join(outputs))
 
         except Exception as e:
             self.logger.log_error(f"Code execution failed: {e}")
@@ -502,7 +531,9 @@ class PodmanExecutor(ContainerExecutor):
         self.user = user or "root"
         if self.user == "root":
             warnings.warn("Running as ROOT user is discouraged")
-        super().__init__("podman", "jupyter", additional_imports, logger, host, port, **kwargs)
+        super().__init__("podman", "jupyter", additional_imports, logger, host, port,
+                         **kwargs)
+        self.installed_packages = self.install_packages(additional_imports)
 
     def _create_image(self):
         if self.user != "root":
